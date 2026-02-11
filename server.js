@@ -29,6 +29,8 @@ app.get("/", (req, res) => res.redirect("/login"));
 app.get("/signup", (req, res) => res.sendFile(path.join(__dirname, "view", "signup.html")));
 app.get("/login", (req, res) => res.sendFile(path.join(__dirname, "view", "login.html")));
 app.get("/chat", (req, res) => res.sendFile(path.join(__dirname, "view", "chat.html")));
+app.get("/private", (req, res) =>res.sendFile(path.join(__dirname, "view", "private.html")));
+
 
 // API routes
 app.use("/api", authRoutes);
@@ -46,22 +48,41 @@ app.use("/api", messagesRoutes);
   }
 })();
 
-// Socketio state
-const userToSocket = new Map(); // username -> socket.id
-const socketToUser = new Map(); // socket.id -> username
+// --- Socket state ---
+const userToSockets = new Map(); // username -> Set(socket.id)
+const socketToUser = new Map();  // socket.id -> username
+
+function addUserSocket(username, socketId) {
+  if (!userToSockets.has(username)) userToSockets.set(username, new Set());
+  userToSockets.get(username).add(socketId);
+}
+
+function removeUserSocket(username, socketId) {
+  const set = userToSockets.get(username);
+  if (!set) return;
+  set.delete(socketId);
+  if (set.size === 0) userToSockets.delete(username);
+}
+
+function emitToUser(username, event, payload, ioInstance) {
+  const set = userToSockets.get(username);
+  if (!set) return;
+  for (const sid of set) {
+    ioInstance.to(sid).emit(event, payload);
+  }
+}
 
 io.on("connection", (socket) => {
-  // register user for private messaging
+  // Register user
   socket.on("register_user", ({ username }) => {
     if (!username) return;
-    userToSocket.set(username, socket.id);
     socketToUser.set(socket.id, username);
+    addUserSocket(username, socket.id);
   });
 
   // Join room
-  socket.on("join_room", async ({ room, username }) => {
+  socket.on("join_room", ({ room, username }) => {
     if (!room || !username) return;
-
     socket.join(room);
     socket.emit("system", { message: `Joined room: ${room}` });
     socket.to(room).emit("system", { message: `${username} joined ${room}` });
@@ -70,13 +91,12 @@ io.on("connection", (socket) => {
   // Leave room
   socket.on("leave_room", ({ room, username }) => {
     if (!room || !username) return;
-
     socket.leave(room);
     socket.emit("system", { message: `Left room: ${room}` });
     socket.to(room).emit("system", { message: `${username} left ${room}` });
   });
 
-  // group message
+  // Group message
   socket.on("group_message", async ({ from_user, room, message }) => {
     if (!from_user || !room || !message) return;
 
@@ -95,12 +115,12 @@ io.on("connection", (socket) => {
         message: saved.message,
         date_sent: saved.date_sent
       });
-    } catch (err) {
+    } catch {
       socket.emit("system", { message: "Error saving group message." });
     }
   });
 
-  //private message
+  // Private message
   socket.on("private_message", async ({ from_user, to_user, message }) => {
     if (!from_user || !to_user || !message) return;
 
@@ -120,30 +140,30 @@ io.on("connection", (socket) => {
         date_sent: saved.date_sent
       };
 
-      // send to sender + receiver if online
+      // sender sees (current socket)
       socket.emit("private_message", payload);
 
-      const toSocketId = userToSocket.get(to_user);
-      if (toSocketId) {
-        io.to(toSocketId).emit("private_message", payload);
-      }
-    } catch (err) {
+      // receiver sees it on ALL their open tabs/pages
+      emitToUser(to_user, "private_message", payload, io);
+    } catch {
       socket.emit("system", { message: "Error saving private message." });
     }
   });
 
-  // Typing indicator 1-to-1
+  // Typing indicator (1-to-1)
   socket.on("typing_private", ({ from_user, to_user, isTyping }) => {
     if (!from_user || !to_user) return;
-    const toSocketId = userToSocket.get(to_user);
-    if (!toSocketId) return;
 
-    io.to(toSocketId).emit("typing_private", { from_user, to_user, isTyping: !!isTyping });
+    emitToUser(to_user, "typing_private", {
+      from_user,
+      to_user,
+      isTyping: !!isTyping
+    }, io);
   });
 
   socket.on("disconnect", () => {
     const username = socketToUser.get(socket.id);
-    if (username) userToSocket.delete(username);
+    if (username) removeUserSocket(username, socket.id);
     socketToUser.delete(socket.id);
   });
 });
